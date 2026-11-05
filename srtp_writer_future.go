@@ -6,7 +6,9 @@
 package webrtc
 
 import (
+	"errors"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,13 +19,32 @@ import (
 
 // srtpWriterFuture blocks Read/Write calls until
 // the SRTP Session is available.
+//
+// RTCP for the encoding arrives on two SRTCP read streams when RTX is
+// negotiated: one for the media SSRC and one for the RTX SSRC. A receiver
+// puts the SSRC of the last packet it received into its transport-wide
+// congestion control feedback, which after a retransmission or RTX padding
+// is the RTX SSRC, so feedback addressed to it must reach the sender too.
+// Read merges both streams; SetReadDeadline applies to the media stream.
 type srtpWriterFuture struct {
-	ssrc           SSRC
-	rtpSender      *RTPSender
-	rtcpReadStream atomic.Value // *srtp.ReadStreamSRTCP
-	rtpWriteStream atomic.Value // *srtp.WriteStreamSRTP
-	mu             sync.Mutex
-	closed         bool
+	ssrc              SSRC
+	rtxSSRC           SSRC
+	rtpSender         *RTPSender
+	rtcpReadStream    atomic.Pointer[srtp.ReadStreamSRTCP]
+	rtcpRTXReadStream atomic.Pointer[srtp.ReadStreamSRTCP]
+	rtpWriteStream    atomic.Pointer[srtp.WriteStreamSRTP]
+	mu                sync.Mutex
+	closed            bool
+
+	// rtcpReads carries the packets of both RTCP read streams when RTX is
+	// negotiated; rtcpClosed is closed by Close so a pending Read returns.
+	rtcpReads  chan srtcpRead
+	rtcpClosed chan struct{}
+}
+
+type srtcpRead struct {
+	buf []byte
+	err error
 }
 
 func (s *srtpWriterFuture) init(returnWhenNoSRTP bool) error { //nolint:cyclop
@@ -54,6 +75,9 @@ func (s *srtpWriterFuture) init(returnWhenNoSRTP bool) error { //nolint:cyclop
 	if s.closed {
 		return io.ErrClosedPipe
 	}
+	if s.rtcpReadStream.Load() != nil {
+		return nil
+	}
 
 	srtcpSession, err := s.rtpSender.transport.getSRTCPSession()
 	if err != nil {
@@ -63,6 +87,14 @@ func (s *srtpWriterFuture) init(returnWhenNoSRTP bool) error { //nolint:cyclop
 	rtcpReadStream, err := srtcpSession.OpenReadStream(uint32(s.ssrc))
 	if err != nil {
 		return err
+	}
+
+	var rtcpRTXReadStream *srtp.ReadStreamSRTCP
+	if s.rtxSSRC != 0 {
+		rtcpRTXReadStream, err = srtcpSession.OpenReadStream(uint32(s.rtxSSRC))
+		if err != nil {
+			return err
+		}
 	}
 
 	srtpSession, err := s.rtpSender.transport.getSRTPSession()
@@ -75,10 +107,63 @@ func (s *srtpWriterFuture) init(returnWhenNoSRTP bool) error { //nolint:cyclop
 		return err
 	}
 
+	if rtcpRTXReadStream != nil {
+		s.rtcpReads = make(chan srtcpRead)
+		s.rtcpClosed = make(chan struct{})
+		s.rtcpRTXReadStream.Store(rtcpRTXReadStream)
+		go s.readRTCPInto(rtcpReadStream, true)
+		go s.readRTCPInto(rtcpRTXReadStream, false)
+	}
 	s.rtcpReadStream.Store(rtcpReadStream)
 	s.rtpWriteStream.Store(rtpWriteStream)
 
 	return nil
+}
+
+// readRTCPInto forwards every packet of stream to rtcpReads until the
+// stream is closed. Only the media stream forwards errors: a deadline set
+// through SetReadDeadline applies to it alone, and the RTX stream has no
+// readers of its own.
+func (s *srtpWriterFuture) readRTCPInto(stream *srtp.ReadStreamSRTCP, forwardErrors bool) {
+	for {
+		buf := make([]byte, s.rtpSender.api.settingEngine.getReceiveMTU())
+		n, err := stream.Read(buf)
+		if err != nil {
+			if !forwardErrors {
+				if isSRTCPStreamClosed(err) {
+					return
+				}
+
+				continue
+			}
+			select {
+			case s.rtcpReads <- srtcpRead{err: err}:
+			case <-s.rtcpClosed:
+				return
+			}
+			if isSRTCPStreamClosed(err) {
+				return
+			}
+
+			continue
+		}
+		select {
+		case s.rtcpReads <- srtcpRead{buf: buf[:n]}:
+		case <-s.rtcpClosed:
+			return
+		}
+	}
+}
+
+// isSRTCPStreamClosed reports whether a read error ends the stream rather
+// than one Read (a deadline).
+func isSRTCPStreamClosed(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+
+	return true
 }
 
 func (s *srtpWriterFuture) Close() error {
@@ -90,16 +175,29 @@ func (s *srtpWriterFuture) Close() error {
 	}
 	s.closed = true
 
-	if value, ok := s.rtcpReadStream.Load().(*srtp.ReadStreamSRTCP); ok {
-		return value.Close()
+	if s.rtcpClosed != nil {
+		close(s.rtcpClosed)
+	}
+	var err error
+	if value := s.rtcpRTXReadStream.Load(); value != nil {
+		err = value.Close()
+	}
+	if value := s.rtcpReadStream.Load(); value != nil {
+		if closeErr := value.Close(); closeErr != nil {
+			err = closeErr
+		}
 	}
 
-	return nil
+	return err
 }
 
 func (s *srtpWriterFuture) Read(b []byte) (n int, err error) {
-	if value, ok := s.rtcpReadStream.Load().(*srtp.ReadStreamSRTCP); ok {
-		return value.Read(b)
+	if value := s.rtcpReadStream.Load(); value != nil {
+		if s.rtcpRTXReadStream.Load() == nil {
+			return value.Read(b)
+		}
+
+		return s.readMerged(b)
 	}
 
 	if err := s.init(false); err != nil || s.rtcpReadStream.Load() == nil {
@@ -109,8 +207,25 @@ func (s *srtpWriterFuture) Read(b []byte) (n int, err error) {
 	return s.Read(b)
 }
 
+// readMerged returns the next packet from either RTCP read stream.
+func (s *srtpWriterFuture) readMerged(b []byte) (int, error) {
+	select {
+	case r := <-s.rtcpReads:
+		if r.err != nil {
+			return 0, r.err
+		}
+		if len(b) < len(r.buf) {
+			return 0, io.ErrShortBuffer
+		}
+
+		return copy(b, r.buf), nil
+	case <-s.rtcpClosed:
+		return 0, io.EOF
+	}
+}
+
 func (s *srtpWriterFuture) SetReadDeadline(t time.Time) error {
-	if value, ok := s.rtcpReadStream.Load().(*srtp.ReadStreamSRTCP); ok {
+	if value := s.rtcpReadStream.Load(); value != nil {
 		return value.SetReadDeadline(t)
 	}
 
@@ -122,7 +237,7 @@ func (s *srtpWriterFuture) SetReadDeadline(t time.Time) error {
 }
 
 func (s *srtpWriterFuture) WriteRTP(header *rtp.Header, payload []byte) (int, error) {
-	if value, ok := s.rtpWriteStream.Load().(*srtp.WriteStreamSRTP); ok {
+	if value := s.rtpWriteStream.Load(); value != nil {
 		return value.WriteRTP(header, payload)
 	}
 
@@ -134,7 +249,7 @@ func (s *srtpWriterFuture) WriteRTP(header *rtp.Header, payload []byte) (int, er
 }
 
 func (s *srtpWriterFuture) Write(b []byte) (int, error) {
-	if value, ok := s.rtpWriteStream.Load().(*srtp.WriteStreamSRTP); ok {
+	if value := s.rtpWriteStream.Load(); value != nil {
 		return value.Write(b)
 	}
 
